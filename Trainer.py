@@ -8,7 +8,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from tqdm.auto import tqdm
-from utils.metrics import pixel_accuracy, mean_IU, boundary_iou, computeQualityMeasures
+from utils.metrics import pixel_accuracy, mean_IU, boundary_iou_after, computeQualityMeasures
 
 def merge_dicts(list):
     output = {}
@@ -77,7 +77,7 @@ class UnetTrainer:
         self.hparameters["metric_best"] = {}
         self.hparameters["metric_best_epoch"] = None
         self.hparameters["trained_epoch"] = None
-        self.hparameters["done"] = False
+        self.hparameters["done"] = None
         need_to_train = None
         if not os.path.exists(os.path.join(self.log_dir, "training_log.json")) or not resume_training:
             p = {key: self.hparameters[key] for key in self._hparameter_list}
@@ -163,7 +163,7 @@ class UnetTrainer:
             #l2_loss = self.loss_func['l2'](self.models['unet'], 0.001)
             pred_probs = F.softmax(output, dim=1)
             gdl_loss = self.loss_func['dice_loss'](pred_probs.to('cpu'), target)
-            unet_loss = 0.001*self.loss_func['criterion'](pred_probs.to('cpu'), dist_map) + gdl_loss
+            unet_loss = 0.01*self.loss_func['criterion'](pred_probs.to('cpu'), dist_map) + gdl_loss
             unet_loss.backward()
             self.optimizers["unet"].step()
             training_loss['unet_loss'].append(unet_loss.item())
@@ -207,7 +207,7 @@ class UnetTrainer:
                 y_eval = np.argmax(y_eval,axis=0)
                 p_acc = pixel_accuracy(y_eval,label.detach().numpy())
                 m_iu = mean_IU(y_eval,label.detach().numpy())
-                b_iou = boundary_iou(label.detach().numpy(), y_eval)
+                b_iou = boundary_iou_after(label.detach().numpy(), y_eval)
                 #avgHausdorff, Hausdorff, dice = computeQualityMeasures(y_eval, label.detach().numpy())
                 testing_loss['pix_acc'].append(p_acc)
                 testing_loss['iou'].append(m_iu)
@@ -229,7 +229,7 @@ class UnetTrainer:
                 print(f"retesting epoch {epoch} metric for trained model")
                 self.load_checkpoints(
                     os.path.join(self.log_dir, f"ckpt-epoch{epoch}.pth"), device)
-                te_losses = self.test_epoch(test_loader, epoch)
+                te_losses = self.test_epoch(test_loader, epoch, device=device)
 
                 for loss_type in te_losses.keys():
                     metric_value = float(te_losses[loss_type].mean())
@@ -281,19 +281,34 @@ class UnetTrainer:
             self.hparameters["metric_best"])
         self.save_training_log(log_path, self.hparameters)
     
-    def save_test_pred(self, test_loader, device='cpu'):
-        best_epoch = self.hparameters["metric_best_epoch"]
-        self.load_checkpoints(os.path.join(self.log_dir, f"ckpt-epoch{best_epoch}.pth"), device)
+    def save_test_pred(self, test_loader, device='cuda:4'):
+        #best_epoch = self.hparameters["metric_best_epoch"]
+        #self.load_checkpoints(os.path.join(self.log_dir, f"ckpt-epoch{best_epoch}.pth"), device)
         pred_dir = os.path.join(self.log_dir, 'pred')
         if not os.path.exists(pred_dir):
             os.mkdir(pred_dir)
         self.models['unet'].eval()
         i = 0
+        testing_loss = {'pix_acc':[], 'iou': [], 'boundary_iou':[]}
+        #pred=[]
         with torch.no_grad():
-            for dic, _, _, _, _  in tqdm(test_loader, desc=f"testing epoch"):
+            for dic, _, _, label in tqdm(test_loader, desc=f"testing epoch"):
+
                 output = self.models['unet'](dic.to(device))
                 y_eval = output.cpu().detach().numpy()
                 y_eval = np.squeeze(y_eval)
-                y_eval = np.argmax(y_eval,axis=0)
-                plt.imsave(os.path.join(pred_dir, 'state_{:03d}.png'.format(i)), y_eval)
+                label = np.squeeze(label)
+                y_eval = np.argmax(y_eval, axis=0)
+                #plt.imsave(os.path.join(pred_dir, 'state_{:03d}.png'.format(i)), y_eval)
+                #pred.append(y_eval)
+                p_acc = pixel_accuracy(y_eval, label.detach().numpy())
+                m_iu = mean_IU(y_eval, label.detach().numpy())
+                b_iou = boundary_iou(label.detach().numpy(), y_eval)
+
+                testing_loss['pix_acc'].append(p_acc)
+                testing_loss['iou'].append(m_iu)
+                testing_loss['boundary_iou'].append(b_iou)
                 i += 1
+            #np.save(os.path.join(pred_dir, 'raw_dic_pred.npy'), pred)
+            testing_loss = {key: sum(value) / len(value) for key, value in testing_loss.items()}
+            print (testing_loss)
